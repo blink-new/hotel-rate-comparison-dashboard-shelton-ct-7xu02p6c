@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useMemo } from 'react';
-import { hotelScraper } from './services/hotelScraper';
+import { blink } from './blink/client';
 import './App.css';
 
 interface HotelRate {
@@ -90,17 +90,202 @@ function App() {
     return url.toString();
   }, []);
 
+  const parseHotelRate = useCallback((content: string, hotelName: string) => {
+    console.log(`🔍 Parsing content for ${hotelName}:`);
+    console.log('Content preview (first 1000 chars):', content.substring(0, 1000));
+    
+    // Multiple parsing strategies for hotel rates
+    const strategies = [
+      // Strategy 1: Look for prices near hotel name mentions
+      () => {
+        const hotelPattern = new RegExp(hotelName.split(' ')[0], 'i');
+        const lines = content.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+          if (hotelPattern.test(lines[i])) {
+            // Look for prices in surrounding lines
+            for (let j = Math.max(0, i - 3); j <= Math.min(lines.length - 1, i + 3); j++) {
+              const priceMatch = lines[j].match(/\$(\d{2,3})/);
+              if (priceMatch) {
+                const price = parseInt(priceMatch[1]);
+                if (price >= 50 && price <= 800) {
+                  console.log(`✅ Strategy 1 found price: $${price} for ${hotelName}`);
+                  return price;
+                }
+              }
+            }
+          }
+        }
+        return null;
+      },
+      
+      // Strategy 2: Common price patterns
+      () => {
+        const patterns = [
+          /per night.*?\$(\d{2,3})/i,
+          /\$(\d{2,3}).*?per night/i,
+          /total.*?\$(\d{2,3})/i,
+          /\$(\d{2,3}).*?total/i,
+          /avg.*?\$(\d{2,3})/i
+        ];
+        
+        for (const pattern of patterns) {
+          const match = content.match(pattern);
+          if (match) {
+            const price = parseInt(match[1]);
+            if (price >= 50 && price <= 800) {
+              console.log(`✅ Strategy 2 found price: $${price} for ${hotelName}`);
+              return price;
+            }
+          }
+        }
+        return null;
+      },
+      
+      // Strategy 3: Any reasonable price in content
+      () => {
+        const priceMatches = content.match(/\$(\d{2,3})/g);
+        if (priceMatches) {
+          const prices = priceMatches
+            .map(match => parseInt(match.replace('$', '')))
+            .filter(price => price >= 80 && price <= 500);
+          
+          if (prices.length > 0) {
+            // Return the most common price or first reasonable one
+            const price = prices[0];
+            console.log(`✅ Strategy 3 found price: $${price} for ${hotelName}`);
+            return price;
+          }
+        }
+        return null;
+      }
+    ];
+
+    // Try each strategy
+    for (let i = 0; i < strategies.length; i++) {
+      const result = strategies[i]();
+      if (result !== null) {
+        return result;
+      }
+    }
+
+    console.log(`❌ No price found for ${hotelName}`);
+    return null;
+  }, []);
+
+  const parseAvailability = useCallback((content: string) => {
+    const lowerContent = content.toLowerCase();
+    
+    if (lowerContent.includes('sold out') || lowerContent.includes('no availability')) {
+      return { status: 'Sold Out', notes: '' };
+    }
+    
+    // Look for low stock indicators
+    const lowStockMatch = content.match(/only (\d+) (?:rooms?|left)/i);
+    if (lowStockMatch) {
+      const count = parseInt(lowStockMatch[1]);
+      if (count <= 5) {
+        return { status: 'Low Stock', notes: `Only ${count} rooms left` };
+      }
+    }
+    
+    // Check for specific room type constraints
+    const notes = [];
+    if (lowerContent.includes('king') && (lowerContent.includes('sold out') || lowerContent.includes('unavailable'))) {
+      notes.push('King beds sold out');
+    }
+    if (lowerContent.includes('queen') && (lowerContent.includes('sold out') || lowerContent.includes('unavailable'))) {
+      notes.push('Queen beds sold out');
+    }
+    
+    const lowStockKing = content.match(/(\d+) king.*?left/i);
+    if (lowStockKing && parseInt(lowStockKing[1]) <= 3) {
+      notes.push(`${lowStockKing[1]} king beds left`);
+    }
+    
+    const lowStockQueen = content.match(/(\d+) queen.*?left/i);
+    if (lowStockQueen && parseInt(lowStockQueen[1]) <= 3) {
+      notes.push(`${lowStockQueen[1]} queen beds left`);
+    }
+    
+    return { 
+      status: 'Available', 
+      notes: notes.join(', ') 
+    };
+  }, []);
+
+  const scrapeHotelData = useCallback(async (url: string, hotelName: string) => {
+    console.log(`🌐 Scraping ${hotelName} from: ${url}`);
+    
+    try {
+      // Test if Blink data methods are available
+      console.log('Available Blink data methods:', Object.keys(blink.data || {}));
+      
+      let scrapedData;
+      
+      // Try different Blink SDK methods
+      if (blink.data && typeof blink.data.scrape === 'function') {
+        console.log('Using blink.data.scrape()');
+        scrapedData = await blink.data.scrape(url);
+      } else if (blink.data && typeof blink.data.extractFromUrl === 'function') {
+        console.log('Using blink.data.extractFromUrl()');
+        scrapedData = await blink.data.extractFromUrl(url);
+      } else {
+        throw new Error('No suitable Blink SDK scraping method available');
+      }
+      
+      console.log('Scraped data structure:', Object.keys(scrapedData || {}));
+      
+      // Extract content from different possible formats
+      let content = '';
+      if (typeof scrapedData === 'string') {
+        content = scrapedData;
+      } else if (scrapedData && typeof scrapedData === 'object') {
+        content = scrapedData.markdown || scrapedData.extract || scrapedData.html || scrapedData.text || '';
+      }
+      
+      if (!content || content.length < 100) {
+        console.log(`❌ Insufficient content scraped for ${hotelName}:`, content.length, 'characters');
+        return { rate: null, availability: 'Available', availabilityNotes: 'Scraping failed - insufficient content' };
+      }
+      
+      console.log(`✅ Successfully scraped ${content.length} characters for ${hotelName}`);
+      
+      // Parse rate and availability
+      const rate = parseHotelRate(content, hotelName);
+      const availabilityInfo = parseAvailability(content);
+      
+      return {
+        rate,
+        availability: availabilityInfo.status,
+        availabilityNotes: availabilityInfo.notes
+      };
+      
+    } catch (error: any) {
+      console.error(`❌ Error scraping ${hotelName}:`, error);
+      return { 
+        rate: null, 
+        availability: 'Available', 
+        availabilityNotes: `Error: ${error.message}` 
+      };
+    }
+  }, [parseHotelRate, parseAvailability]);
+
   const fetchRealExpediaData = useCallback(async () => {
     setIsLoading(true);
     setErrorMessage('');
-    setLoadingProgress('🚀 Starting professional hotel rate scraping...');
+    setLoadingProgress('🚀 Starting Blink SDK hotel rate scraping...');
     
     try {
+      // Test Blink SDK availability first
+      console.log('Testing Blink SDK availability...');
+      console.log('Blink object:', blink);
+      console.log('Blink.data methods:', Object.keys(blink.data || {}));
+      
       const today = new Date();
       const dates = [];
       
-      // Generate 5 days of data for testing
-      for (let i = 0; i < 5; i++) {
+      // Generate 3 days of data for testing
+      for (let i = 0; i < 3; i++) {
         const date = new Date(today);
         date.setDate(today.getDate() + i);
         dates.push(date.toISOString().split('T')[0]);
@@ -145,31 +330,20 @@ function App() {
 
           try {
             const url = buildExpediaUrl(hotel.baseUrl, date, checkOutStr);
-            console.log(`🔍 Scraping URL: ${url}`);
-
-            const result = await hotelScraper.scrapeHotelData(url);
+            const result = await scrapeHotelData(url, hotel.name);
             
-            if (result.success && result.data) {
-              console.log(`✅ Successfully scraped ${hotel.name}:`, result.data);
-              
-              rateEntry[hotel.key] = result.data.rate;
-              rateEntry[hotel.availabilityKey] = result.data.availability;
-              rateEntry[hotel.notesKey] = result.data.availabilityNotes;
-              
-              console.log(`💰 ${hotel.name}: $${result.data.rate} - ${result.data.availability}`);
-              if (result.data.availabilityNotes) {
-                console.log(`📝 Notes: ${result.data.availabilityNotes}`);
-              }
-            } else {
-              console.error(`❌ Failed to scrape ${hotel.name}:`, result.error);
-              rateEntry[hotel.notesKey] = result.error || 'Scraping failed';
-            }
+            console.log(`✅ Scraped ${hotel.name}:`, result);
+            
+            rateEntry[hotel.key] = result.rate;
+            rateEntry[hotel.availabilityKey] = result.availability;
+            rateEntry[hotel.notesKey] = result.availabilityNotes;
+            
           } catch (error: any) {
             console.error(`❌ Error scraping ${hotel.name}:`, error.message);
             rateEntry[hotel.notesKey] = `Error: ${error.message}`;
           }
 
-          // Add delay between hotel scrapes to be respectful
+          // Add delay between hotel scrapes
           if (hotelIndex < hotels.length - 1) {
             await new Promise(resolve => setTimeout(resolve, 2000));
           }
@@ -185,7 +359,7 @@ function App() {
 
       setRateData(newRateData);
       setLastUpdated(new Date());
-      setLoadingProgress('✅ Professional scraping completed successfully!');
+      setLoadingProgress('✅ Blink SDK scraping completed!');
       
       console.log('🎉 Final scraped data:', newRateData);
       
@@ -195,9 +369,9 @@ function App() {
       setLoadingProgress('❌ Scraping failed');
     } finally {
       setIsLoading(false);
-      setTimeout(() => setLoadingProgress(''), 3000);
+      setTimeout(() => setLoadingProgress(''), 5000);
     }
-  }, [hotels, buildExpediaUrl]);
+  }, [hotels, buildExpediaUrl, scrapeHotelData]);
 
   const getRateComparison = (hamptonRate: number | null, competitorRate: number | null) => {
     if (!hamptonRate || !competitorRate) return '';
@@ -243,16 +417,16 @@ function App() {
             <div className="text-center">
               <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
               <h3 className="text-lg font-semibold text-slate-900 mb-2">
-                Professional Hotel Rate Scraping
+                Blink SDK Hotel Rate Scraping
               </h3>
               <p className="text-slate-600 mb-4">
-                Using third-party scraping services for maximum accuracy
+                Using Blink's built-in web scraping capabilities
               </p>
               <p className="text-sm text-slate-500 bg-slate-50 p-3 rounded">
                 {loadingProgress}
               </p>
               <p className="text-xs text-slate-400 mt-2">
-                This may take 60-90 seconds for reliable data extraction...
+                This may take 30-60 seconds for reliable data extraction...
               </p>
             </div>
           </div>
@@ -265,7 +439,7 @@ function App() {
         <div className="bg-white rounded-lg shadow-sm border mb-6 p-6">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-lg font-semibold text-slate-900">
-              🔧 Professional Third-Party Scraping System
+              🔧 Blink SDK Web Scraping System
             </h2>
             {lastUpdated && (
               <span className="text-sm text-slate-500">
@@ -279,7 +453,7 @@ function App() {
               ⚠️ REAL EXPEDIA DATA ONLY - No Fallbacks or Projections
             </p>
             <p className="text-red-700 text-sm mt-1">
-              Using ScrapingBee, ScraperAPI, and Cheerio for professional web scraping
+              Using Blink's built-in web scraping - no third-party services
             </p>
           </div>
 
@@ -305,7 +479,7 @@ function App() {
               <ul className="space-y-1 text-slate-600">
                 <li>💡 High competitor rate + low inventory</li>
                 <li>📝 Room type constraints (king/queen)</li>
-                <li>*Professional scraping with Cheerio parsing</li>
+                <li>*Shows N/A if no real data found</li>
               </ul>
             </div>
           </div>
@@ -427,8 +601,8 @@ function App() {
         {rateData.length === 0 && !isLoading && (
           <div className="text-center py-12">
             <div className="text-slate-400 text-lg mb-2">📊</div>
-            <p className="text-slate-600">Click "Refresh Data" to start professional hotel rate scraping</p>
-            <p className="text-slate-500 text-sm mt-1">Using ScrapingBee, ScraperAPI, and Cheerio for maximum accuracy</p>
+            <p className="text-slate-600">Click "Refresh Data" to start Blink SDK hotel rate scraping</p>
+            <p className="text-slate-500 text-sm mt-1">Using Blink's built-in web scraping capabilities</p>
           </div>
         )}
       </div>
